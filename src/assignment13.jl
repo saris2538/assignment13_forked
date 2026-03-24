@@ -59,20 +59,54 @@ function partition_data(strain::AbstractArray, stress::AbstractArray, comm::MPI.
     # to use the variable prefix "my_" for local (to processor) variables so you
     # might choose to return:
     # (my_strain, my_stress)
+    rank = MPI.Comm_rank(comm)
+    size = MPI.Comm_size(comm)
+    len = length(strain)
+
+    # Initialize lengths and offset on all processors, but only fill them on the root processor (i.e. rank 0)
+    lengths = nothing
+    offset = nothing
+    
+    if rank == 0
+        remainder = len % size
+        chunk_size = len ÷ size
+        lengths = fill(chunk_size, size)
+        lengths[1:remainder] .+= 1
+        lengths[2:end] .+= 1  # including overlapping points
+
+        offset = zeros(Int, size)
+        offset[2:end] = cumsum(lengths[1:end-1]) .- collect(1:(size-1))  # adjust for overlapping points
+    end
+
+    # the values of lengths and offsets exist only on the root processor
+    # send lengths and offsets to all processors
+    lengths = MPI.bcast(lengths, 0, comm)
+    offset = MPI.bcast(offset, 0, comm)
+
+    # processors get arrays --> need Scatterv! --> need to allocate blank arrays on each processor to receive the data
+    my_stress = Vector{Float64}(undef, lengths[rank + 1])
+    my_strain = Vector{Float64}(undef, lengths[rank + 1])
+
+    MPI.Scatterv!(MPI.VBuffer(strain, lengths, offset, MPI.DOUBLE), my_strain, 0, comm)
+    MPI.Scatterv!(MPI.VBuffer(stress, lengths, offset, MPI.DOUBLE), my_stress, 0, comm)
+
+    return (my_strain, my_stress)
 end
 
 function compute_toughness_parallel(filename::String, comm::MPI.Comm)
     if MPI.Comm_rank(comm) == 0
         strain, stress = convert_to_true_stress_and_strain(filename)
     else
-        strain, stress = [], []
+        strain, stress = [], []   # have to be initialized on all processors
     end
     # Uncomment the line below once you've implemented partition_data
-    # my_strain, my_stress = partition_data(strain, stress, comm)
+    my_strain, my_stress = partition_data(strain, stress, comm)    
     
     # Integrate the partial stress-strain curves on each processor with trapz(),
     # then return the result of a parallel reduction summation to the root
     # (i.e.\ rank 0) processor.
+    MPI.Reduce(trapz(my_strain, my_stress), +, comm; root=0)
+
 end
 
 function run_parallel(filename::String)
